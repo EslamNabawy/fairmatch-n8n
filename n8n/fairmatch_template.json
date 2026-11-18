@@ -1,0 +1,339 @@
+{
+  "name": "FairMatch (sanitized template)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "2bd112de-64ff-4a12-aed4-b92c45a4527f",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -224,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Responses",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "options": {}
+      },
+      "id": "c702bcc9-a3fc-41ce-9587-0b06e00a82c2",
+      "name": "Read Raw Responses",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Clean, Deduplicate, Normalize, and Impute Survey Responses\n// Input: Raw rows from Google Sheets / Excel\n// Output: Cleaned profiles, matrices, diagnostics, and metadata\n\nconst rawItems = items.map(item => item.json);\n\nif (!rawItems.length) {\n  throw new Error('No responses received from Google Sheets / Excel.');\n}\n\nconst text = val => String(val ?? '').trim();\n// Identity = first 2 tokens (user decision; matches \"Participant Example\" style).\n// Uniqueness is enforced below: any collision throws instead of merging people.\nconst shortName = val => text(val).split(/\\s+/).filter(Boolean).slice(0, 2).join(' ');\n\n// Optional roster configuration. Keep this empty to discover the roster from\n// input rows, or provide [{ name: 'Participant 01', gender: 'M' }, ...] when\n// non-submitters must be included. Do not hard-code production identities in\n// the workflow export; configure them in the private n8n instance instead.\nconst ROSTER = [];\nconst KNOWN_GENDER_MAP = Object.fromEntries(\n  ROSTER.map(person => [text(person.name), String(person.gender || '').toUpperCase()])\n);\n\n// Short-name gender index (first 2 tokens) so shortened roster still resolves gender\nconst KNOWN_GENDER_SHORT = {};\nfor (const [k, v] of Object.entries(KNOWN_GENDER_MAP)) {\n  const s = shortName(k);\n  if (s in KNOWN_GENDER_SHORT) {\n    throw new Error(`Name collision: \"${k}\" shortens to \"${s}\", already used. Refine shortName.`);\n  }\n  KNOWN_GENDER_SHORT[s] = v;\n}\n\nconst parseDate = val => {\n  const t = Date.parse(text(val));\n  return Number.isNaN(t) ? 0 : t;\n};\n\n// 1. Parse each row safely\nconst parsedRows = [];\nconst parseErrors = [];\n\nfor (let i = 0; i < rawItems.length; i++) {\n  const row = rawItems[i];\n  const displayName = shortName(row.display_name || row['Display Name'] || row.name || row.Name);\n  \n  if (!displayName) {\n    parseErrors.push(`Row ${i + 1} skipped: missing display_name`);\n    continue;\n  }\n\n  let survey = {};\n  const rawEmail = row.email || row.Email || row.payload;\n  \n  if (row.self || row.skill || row.fit || row.selfName) {\n    survey = {\n      selfName: row.selfName,\n      submittedAt: row.submittedAt,\n      self: row.self || {},\n      skill: row.skill || {},\n      fit: row.fit || {},\n    };\n  } else if (rawEmail) {\n    if (typeof rawEmail === 'object') {\n      survey = rawEmail;\n    } else {\n      try {\n        survey = JSON.parse(text(rawEmail));\n      } catch (e1) {\n        try {\n          survey = JSON.parse(text(rawEmail).replace(/\"\"/g, '\"'));\n        } catch (e2) {\n          parseErrors.push(`Row ${i + 1} (${displayName}): Malformed JSON payload - ${e2.message}`);\n          survey = {};\n        }\n      }\n    }\n  }\n\n  const selfName = shortName(survey.selfName) || displayName;\n  const submittedAt = text(survey.submittedAt) || text(row.person_id) || text(row.Timestamp);\n  const submittedTimestamp = parseDate(submittedAt) || (i + 1);\n\n  const cleanObject = obj => {\n    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};\n    const res = {};\n    for (const [k, v] of Object.entries(obj)) {\n      const cleanKey = shortName(k);\n      const num = Number(v);\n      if (cleanKey && !Number.isNaN(num)) {\n        res[cleanKey] = num;\n      }\n    }\n    return res;\n  };\n\n  const self = cleanObject(survey.self);\n  const skill = cleanObject(survey.skill);\n  const fit = cleanObject(survey.fit);\n\n  const sheetGender = text(row.gender || row.Gender).toUpperCase();\n  const gender = sheetGender === 'M' || sheetGender === 'F' ? sheetGender : (KNOWN_GENDER_SHORT[selfName] || KNOWN_GENDER_SHORT[displayName] || '');\n\n  parsedRows.push({\n    row_number: row.row_number ?? (i + 1),\n    display_name: displayName,\n    self_name: selfName,\n    submitted_at: submittedAt,\n    submitted_timestamp: submittedTimestamp,\n    gender,\n    self,\n    skill,\n    fit,\n  });\n}\n\n// 2. Deduplicate: keep latest submission per person\nconst latestByPerson = new Map();\nconst deduplicationAudit = [];\n\nfor (const row of parsedRows) {\n  const key = row.self_name;\n  const existing = latestByPerson.get(key);\n  if (!existing || row.submitted_timestamp >= existing.submitted_timestamp) {\n    if (existing) {\n      deduplicationAudit.push({\n        person: key,\n        dropped_timestamp: existing.submitted_at,\n        kept_timestamp: row.submitted_at,\n      });\n    }\n    latestByPerson.set(key, row);\n  }\n}\n\nconst latestResponses = Array.from(latestByPerson.values());\n\n// 3. Fixed roster (Python parity: roster file pins 24 members; unknown rated\n// names are ignored + warned, never become ghost participants)\nconst hasExplicitRoster = ROSTER.length > 0;\nconst rosterNamesSet = new Set(Object.keys(KNOWN_GENDER_SHORT));\nconst unknownNames = new Set();\nconst noteUnknown = (name, resp) => {\n  if (hasExplicitRoster && name && !rosterNamesSet.has(name)) {\n    if (!unknownNames.has(name)) {\n      unknownNames.add(name);\n      parseErrors.push(`Unknown name ignored (not in fixed roster): \"${name}\" (rater ${resp})`);\n    }\n    return true;\n  }\n  return false;\n};\nfor (const resp of latestResponses) {\n  if (!noteUnknown(resp.self_name, resp.self_name)) rosterNamesSet.add(resp.self_name);\n  for (const name of Object.keys(resp.skill)) {\n    if (!noteUnknown(name, resp.self_name)) rosterNamesSet.add(name);\n  }\n  for (const name of Object.keys(resp.fit)) {\n    if (!noteUnknown(name, resp.self_name)) rosterNamesSet.add(name);\n  }\n}\n\nconst rosterNames = Array.from(rosterNamesSet).filter(Boolean);\n\n// Detect gender for every roster member\nconst roster = rosterNames.map((name, index) => {\n  const resp = latestByPerson.get(name);\n  let g = resp?.gender || KNOWN_GENDER_SHORT[name];\n  if (!g) {\n    g = 'F';\n  }\n  return {\n    person_id: `p${String(index + 1).padStart(2, '0')}`,\n    display_name: name,\n    gender: g,\n    active: true,\n    has_submitted: latestByPerson.has(name),\n  };\n});\n\nconst rosterByName = new Map(roster.map(p => [p.display_name, p]));\n\n// 4. Auto-detect rating scale & normalize (1-10 -> 1-5)\nconst allVals = [];\nfor (const resp of latestResponses) {\n  for (const v of Object.values(resp.self)) allVals.push(v);\n  for (const v of Object.values(resp.skill)) allVals.push(v);\n  for (const v of Object.values(resp.fit)) allVals.push(v);\n}\n\nconst maxRaw = allVals.length ? Math.max(...allVals) : 10;\nconst scale = v => {\n  if (v === undefined || v === null || Number.isNaN(Number(v))) return 3.0;\n  const num = Number(v);\n  if (maxRaw <= 5) return num;\n  return Number((1.0 + (num - 1.0) * 4.0 / (maxRaw - 1.0)).toFixed(3));\n};\n\n// 5. Flatten responses & build peer ratings\nconst flatResponses = [];\nfor (const resp of latestResponses) {\n  const rater = resp.self_name;\n  const s = resp.self;\n  \n  flatResponses.push({\n    rater,\n    target: rater,\n    devops: scale(s.devops ?? 3),\n    ai_ml: scale(s.aiml ?? s.ai_ml ?? 3),\n    technical: scale(s.general ?? s.technical ?? 3),\n    involvement: scale(s.involvement ?? 3),\n    willing: 3.0,\n    is_imputed: false,\n  });\n\n  const allTargets = new Set([...Object.keys(resp.skill), ...Object.keys(resp.fit)]);\n  for (const target of allTargets) {\n    if (!rosterByName.has(target)) continue;\n    const sVal = resp.skill[target];\n    const fVal = resp.fit[target];\n    const svv = sVal !== undefined ? scale(sVal) : 3.0;\n    const fvv = fVal !== undefined ? scale(fVal) : 3.0;\n    \n    flatResponses.push({\n      rater,\n      target,\n      devops: svv,\n      ai_ml: svv,\n      technical: svv,\n      involvement: svv,\n      willing: fvv,\n      is_imputed: false,\n    });\n  }\n}\n\n// 6. Missing participant imputation (peer consensus mean)\nconst peerSkillRecv = new Map();\nconst peerWillRecv = new Map();\nfor (const name of rosterNames) {\n  peerSkillRecv.set(name, []);\n  peerWillRecv.set(name, []);\n}\n\nfor (const r of flatResponses) {\n  if (r.rater !== r.target && rosterByName.has(r.target)) {\n    peerSkillRecv.get(r.target)?.push(r.devops);\n    peerWillRecv.get(r.target)?.push(r.willing);\n  }\n}\n\nconst skillMean = {};\nconst willMean = {};\nfor (const name of rosterNames) {\n  const sArr = peerSkillRecv.get(name) || [];\n  const wArr = peerWillRecv.get(name) || [];\n  skillMean[name] = sArr.length ? Number((sArr.reduce((a, b) => a + b, 0) / sArr.length).toFixed(3)) : 3.0;\n  willMean[name] = wArr.length ? Number((wArr.reduce((a, b) => a + b, 0) / wArr.length).toFixed(3)) : 3.0;\n}\n\nconst missingSubmitters = rosterNames.filter(name => !latestByPerson.has(name));\nfor (const m of missingSubmitters) {\n  const selfVal = skillMean[m];\n  flatResponses.push({\n    rater: m,\n    target: m,\n    devops: selfVal,\n    ai_ml: selfVal,\n    technical: selfVal,\n    involvement: selfVal,\n    willing: 3.0,\n    is_imputed: true,\n  });\n  for (const t of rosterNames) {\n    if (t === m) continue;\n    flatResponses.push({\n      rater: m,\n      target: t,\n      devops: skillMean[t],\n      ai_ml: skillMean[t],\n      technical: skillMean[t],\n      involvement: skillMean[t],\n      willing: willMean[t],\n      is_imputed: true,\n    });\n  }\n}\n\n// 7. Compute Skill Profiles & Self-Disagreement Flags\nconst DIMS = ['devops', 'ai_ml', 'technical', 'involvement'];\nconst TECH_DIMS = ['devops', 'ai_ml', 'technical'];\nconst DISAGREEMENT_THRESHOLD = 1.5;\n\nconst peerVals = {};\nconst selfVals = {};\nfor (const name of rosterNames) {\n  peerVals[name] = { devops: [], ai_ml: [], technical: [], involvement: [] };\n  selfVals[name] = {};\n}\n\nfor (const r of flatResponses) {\n  if (r.rater === r.target) {\n    for (const d of DIMS) selfVals[r.target][d] = r[d];\n  } else {\n    for (const d of DIMS) peerVals[r.target][d].push(r[d]);\n  }\n}\n\nconst profiles = {};\nconst diagnostics = {\n  disagreements: [],\n  rater_consistency: [],\n  low_flags: [],\n  low_confidence: [],\n  deduplications: deduplicationAudit,\n  parse_errors: parseErrors,\n  missing_submitters: missingSubmitters,\n};\n\nfor (const person of roster) {\n  const name = person.display_name;\n  const prof = {\n    name,\n    gender: person.gender,\n    peer: {},\n    self: {},\n    final: {},\n    gap: {},\n    flag: {},\n    peer_count: {},\n  };\n\n  for (const d of DIMS) {\n    const pList = peerVals[name][d];\n    const peerScore = pList.length ? Number((pList.reduce((a, b) => a + b, 0) / pList.length).toFixed(3)) : 3.0;\n    const selfScore = selfVals[name][d] ?? peerScore;\n    const gap = Number((selfScore - peerScore).toFixed(3));\n    let flag = null;\n\n    if (gap > DISAGREEMENT_THRESHOLD) {\n      flag = 'OVER_SELF_RATED';\n      diagnostics.disagreements.push({ person: name, dim: d, self: selfScore, peer: peerScore, gap, flag });\n    } else if (gap < -DISAGREEMENT_THRESHOLD) {\n      flag = 'UNDER_SELF_RATED';\n      diagnostics.disagreements.push({ person: name, dim: d, self: selfScore, peer: peerScore, gap, flag });\n    }\n\n    let finalScore;\n    if (flag !== null) {\n      finalScore = peerScore;\n    } else {\n      if (TECH_DIMS.includes(d)) {\n        finalScore = Number((0.8 * peerScore + 0.2 * selfScore).toFixed(3));\n      } else {\n        finalScore = Number((0.5 * peerScore + 0.5 * selfScore).toFixed(3));\n      }\n    }\n\n    prof.peer[d] = peerScore;\n    prof.self[d] = selfScore;\n    prof.gap[d] = gap;\n    prof.flag[d] = flag;\n    prof.final[d] = finalScore;\n    prof.peer_count[d] = pList.length;\n  }\n\n  prof.overall_skill = Number((DIMS.reduce((sum, d) => sum + prof.final[d], 0) / DIMS.length).toFixed(3));\n  profiles[name] = prof;\n}\n\n// 7b. Low-confidence flags + rater consistency (Python parity: compute_profiles 1.4/1.6)\nconst expectedRaters = roster.length - 1;\nfor (const person of roster) {\n  for (const d of DIMS) {\n    const pc = profiles[person.display_name].peer_count[d];\n    if (pc < Math.max(3, expectedRaters * 0.3)) {\n      diagnostics.low_flags.push(`${person.display_name} ${d}: ${pc}/${expectedRaters} peer ratings LOW_CONFIDENCE`);\n    }\n  }\n}\nconst pearson = (x, y) => {\n  const n = x.length;\n  if (n !== y.length || n < 2) return null;\n  const mx = x.reduce((a, b) => a + b, 0) / n;\n  const my = y.reduce((a, b) => a + b, 0) / n;\n  let num = 0, dx = 0, dy = 0;\n  for (let i = 0; i < n; i++) {\n    num += (x[i] - mx) * (y[i] - my);\n    dx += (x[i] - mx) ** 2;\n    dy += (y[i] - my) ** 2;\n  }\n  const denx = Math.sqrt(dx), deny = Math.sqrt(dy);\n  if (denx === 0 || deny === 0) return 0.0;\n  return num / (denx * deny);\n};\nconst skillByRater = {};\nconst willByRater = {};\nfor (const r of flatResponses) {\n  if (r.rater === r.target) continue;\n  const tech = TECH_DIMS.map(d => r[d]).filter(v => v !== undefined && v !== null);\n  if (!tech.length) continue;\n  (skillByRater[r.rater] = skillByRater[r.rater] || []).push(tech.reduce((a, b) => a + b, 0) / tech.length);\n  (willByRater[r.rater] = willByRater[r.rater] || []).push(r.willing);\n}\nfor (const rater of Object.keys(skillByRater)) {\n  const sv = skillByRater[rater];\n  if (sv.length >= 10) {\n    const corr = pearson(sv, willByRater[rater]);\n    if (corr !== null && corr > 0.75) {\n      diagnostics.rater_consistency.push({ rater, correlation: Number(corr.toFixed(3)), n: sv.length });\n    }\n  }\n}\n\n// 8. Build Directed & Pairwise Willingness / Veto Matrices\nconst directedWilling = {};\nfor (const name of rosterNames) directedWilling[name] = {};\n\nfor (const r of flatResponses) {\n  if (r.rater !== r.target) {\n    directedWilling[r.rater][r.target] = r.willing;\n  }\n}\n\nconst pairMin = {};\nconst pairAvg = {};\nconst vetoPairs = [];\nconst lowPairs = [];\n\nfor (const a of rosterNames) {\n  pairMin[a] = {};\n  pairAvg[a] = {};\n}\n\nfor (let i = 0; i < rosterNames.length; i++) {\n  const a = rosterNames[i];\n  for (let j = i + 1; j < rosterNames.length; j++) {\n    const b = rosterNames[j];\n    const ab = directedWilling[a]?.[b] ?? 3.0;\n    const ba = directedWilling[b]?.[a] ?? 3.0;\n    const minW = Number(Math.min(ab, ba).toFixed(3));\n    const avgW = Number(((ab + ba) / 2.0).toFixed(3));\n\n    pairMin[a][b] = minW;\n    pairMin[b][a] = minW;\n    pairAvg[a][b] = avgW;\n    pairAvg[b][a] = avgW;\n\n    if (minW <= 1.5) {\n      vetoPairs.push({ p1: a, p2: b, min_willing: minW, rater_a_to_b: ab, rater_b_to_a: ba });\n    } else if (minW < 2.5) {\n      lowPairs.push({ p1: a, p2: b, min_willing: minW });\n    }\n  }\n}\n\nreturn [{\n  json: {\n    runId: `run-${new Date().toISOString()}`,\n    roster,\n    profiles,\n    pairMin,\n    pairAvg,\n    vetoPairs,\n    lowPairs,\n    flatResponses,\n    flatRowCount: flatResponses.length,\n    diagnostics,\n    metadata: {\n      raw_rows: rawItems.length,\n      unique_respondents: latestResponses.length,\n      missing_submitters: missingSubmitters.length,\n      roster_size: roster.length,\n      veto_pair_count: vetoPairs.length,\n      scale_max_detected: maxRaw,\n      generated_at: new Date().toISOString(),\n    }\n  }\n}];\n"
+      },
+      "id": "b93fc018-1f25-431c-ad9f-4fa32e70a5f7",
+      "name": "Clean and Normalize Responses",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: FairMatch v4 solver engine — exact port of Python fairmatch.py v4 main path\r\n// (penalty draft_v4 + steepest refinement_v4 + MT19937 seeds + raw tuple selection).\r\n// Fairness scores/grades (0-100) are an n8n-only presentation extra.\r\nconst input = items[0].json;\r\nconst { roster, profiles, pairMin, vetoPairs } = input;\r\n\r\nconst K = 4; // Target 4 teams\r\nconst N = roster.length;\r\nconst VETO_THRESHOLD = 1.5;\r\nconst WILL_LOW_PAIR = 2.5;\r\nconst MIN_WILL_FLOOR = 2.5;\r\nconst MIN_DIMENSION_COVERAGE = 3.0;\r\nconst TEAM_AVG_GAP_THRESHOLD = 0.6;\r\nconst SPREAD_GAP_THRESHOLD = 0.75;\r\nconst LEVEL_ORDER = ['L1', 'L2V', 'L2', 'L2C', 'L5', 'L3', 'L6', 'L4'];\r\nconst MAX_PASSES = 6;\r\nconst NUM_STARTS = 20;\r\nconst RANDOM_SEED = 42;\r\n\r\nconst rosterNames = roster.map(p => p.display_name);\r\nconst genderOf = {};\r\nfor (const p of roster) genderOf[p.display_name] = p.gender;\r\nconst totalM = roster.filter(p => p.gender === 'M').length;\r\nconst totalF = N - totalM;\r\n\r\n// ---- CPython-compatible Mersenne Twister (validated bit-identical) ----\r\nfunction MT19937(seed) {\r\n  const NN = 624, MM = 397, AA = 0x9908b0df;\r\n  const mt = new Array(NN);\r\n  const key = [];\r\n  let x = Math.floor(seed);\r\n  if (!(x > 0)) key.push(0);\r\n  while (x > 0) { key.push(x % 0x100000000); x = Math.floor(x / 0x100000000); }\r\n  mt[0] = 19650218 >>> 0;\r\n  for (let i = 1; i < NN; i++) {\r\n    mt[i] = (Math.imul(1812433253, mt[i - 1] ^ (mt[i - 1] >>> 30)) + i) >>> 0;\r\n  }\r\n  let ii = 1, jj = 0;\r\n  const kk = Math.max(NN, key.length);\r\n  for (let c = 0; c < kk; c++) {\r\n    mt[ii] = (mt[ii] ^ Math.imul(mt[ii - 1] ^ (mt[ii - 1] >>> 30), 1664525)) >>> 0;\r\n    mt[ii] = (mt[ii] + key[jj] + jj) >>> 0;\r\n    ii++; jj++;\r\n    if (ii >= NN) { mt[0] = mt[NN - 1]; ii = 1; }\r\n    if (jj >= key.length) jj = 0;\r\n  }\r\n  for (let c = 0; c < NN - 1; c++) {\r\n    mt[ii] = (mt[ii] ^ Math.imul(mt[ii - 1] ^ (mt[ii - 1] >>> 30), 1566083941)) >>> 0;\r\n    mt[ii] = (mt[ii] - ii) >>> 0;\r\n    ii++;\r\n    if (ii >= NN) { mt[0] = mt[NN - 1]; ii = 1; }\r\n  }\r\n  mt[0] = 0x80000000;\r\n  let mti = NN;\r\n  const twist = () => {\r\n    for (let i = 0; i < NN; i++) {\r\n      const y = (mt[i] & 0x80000000) + (mt[(i + 1) % NN] & 0x7fffffff);\r\n      mt[i] = (mt[(i + MM) % NN] ^ (y >>> 1) ^ ((y & 1) ? AA : 0)) >>> 0;\r\n    }\r\n    mti = 0;\r\n  };\r\n  const int32 = () => {\r\n    if (mti >= NN) twist();\r\n    let y = mt[mti++];\r\n    y ^= y >>> 11;\r\n    y ^= (y << 7) & 0x9d2c5680;\r\n    y ^= (y << 15) & 0xefc60000;\r\n    y ^= y >>> 18;\r\n    return y >>> 0;\r\n  };\r\n  const random = () => ((int32() >>> 5) * 67108864.0 + (int32() >>> 6)) / 9007199254740992.0;\r\n  const getrandbits = k => {\r\n    let r = 0, rem = k;\r\n    while (rem > 0) {\r\n      const take = Math.min(32, rem);\r\n      r = r * Math.pow(2, take) + (int32() >>> (32 - take));\r\n      rem -= take;\r\n    }\r\n    return r;\r\n  };\r\n  const randbelow = n => {\r\n    if (!(n > 0)) throw new Error('randbelow: empty range');\r\n    const k = n.toString(2).length;\r\n    let r = getrandbits(k);\r\n    while (r >= n) r = getrandbits(k);\r\n    return r;\r\n  };\r\n  const shuffle = arr => {\r\n    for (let i = arr.length - 1; i > 0; i--) {\r\n      const j = randbelow(i + 1);\r\n      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;\r\n    }\r\n    return arr;\r\n  };\r\n  return { random, shuffle };\r\n}\r\n\r\nclass InfeasibleError extends Error {\r\n  constructor(reason, relax, partial) {\r\n    super(reason);\r\n    this.reason = reason;\r\n    this.tier_relaxations = relax;\r\n    this.partial = partial;\r\n  }\r\n}\r\n\r\n// ---- Gender slots (Python gender_slots verbatim) ----\r\nfunction genderSlots(totalM_, totalF_, k) {\r\n  const n = totalM_ + totalF_;\r\n  const sizes = Array.from({ length: k }, (_, i) => Math.floor(n / k) + (i < (n % k) ? 1 : 0));\r\n  const distribute = total => Array.from({ length: k }, (_, i) => Math.floor(total / k) + (i < (total % k) ? 1 : 0));\r\n  const mDist = distribute(totalM_);\r\n  const fDist = distribute(totalF_);\r\n  if (mDist.every((m, i) => m + fDist[i] === sizes[i])) return [mDist, fDist];\r\n  const even = s => Math.max(...s) - Math.min(...s);\r\n  const fA = sizes.map((s, i) => s - mDist[i]);\r\n  const mB = sizes.map((s, i) => s - fDist[i]);\r\n  const validA = fA.every(x => x >= 0) && even(fA) <= 1;\r\n  const validB = mB.every(x => x >= 0) && even(mB) <= 1;\r\n  if (validA && validB) return [mDist, fA];\r\n  if (validA) return [mDist, fA];\r\n  if (validB) return [mB, fDist];\r\n  return [mDist, fDist];\r\n}\r\nconst [mSlots, fSlots] = genderSlots(totalM, totalF, K);\r\nconst teamSizes = mSlots.map((m, i) => m + fSlots[i]);\r\nif (mSlots.reduce((a, b) => a + b, 0) !== totalM || fSlots.reduce((a, b) => a + b, 0) !== totalF) {\r\n  throw new Error(`Preflight: slots sum != pool (M ${mSlots} vs ${totalM}, F ${fSlots} vs ${totalF})`);\r\n}\r\n\r\n// ---- Tiers (Python build_tiers verbatim, + display labels) ----\r\nfunction buildTiers(mSlots_, fSlots_) {\r\n  const out = {};\r\n  for (const gender of ['M', 'F']) {\r\n    const slots = gender === 'M' ? mSlots_ : fSlots_;\r\n    const pool = rosterNames.filter(n => genderOf[n] === gender);\r\n    const sorted = pool.slice().sort((a, b) => profiles[b].overall_skill - profiles[a].overall_skill);\r\n    const maxSlots = Math.max(...slots);\r\n    const demands = [];\r\n    for (let i = 1; i <= maxSlots; i++) demands.push(slots.filter(s => s >= i).length);\r\n    if (demands.reduce((a, b) => a + b, 0) !== sorted.length) {\r\n      throw new Error(`Tier build mismatch gender ${gender}`);\r\n    }\r\n    const tiers = [];\r\n    let idx = 0;\r\n    demands.forEach((dem, ti) => {\r\n      const members = sorted.slice(idx, idx + dem);\r\n      for (const name of members) {\r\n        profiles[name].tier = ti + 1;\r\n        profiles[name].tier_demand = dem;\r\n        profiles[name].tierLabel = (ti + 1) === 1 ? 'Tier 1 (Top Talent)' : `Tier ${ti + 1}`;\r\n      }\r\n      tiers.push(members);\r\n      idx += dem;\r\n    });\r\n    out[gender] = { tiers, demands, count: maxSlots };\r\n  }\r\n  return out;\r\n}\r\n\r\n// ---- Evaluation helpers ----\r\nconst DIMS = ['devops', 'ai_ml', 'technical', 'involvement'];\r\nconst TECH_DIMS = ['devops', 'ai_ml', 'technical'];\r\nconst teamSkillAvg = team => {\r\n  if (!team.length) return 0;\r\n  return Number((team.reduce((s, n) => s + profiles[n].overall_skill, 0) / team.length).toFixed(3));\r\n};\r\nconst teamWorstWilling = team => {\r\n  if (team.length < 2) return 5.0;\r\n  let worst = 5.0;\r\n  for (let i = 0; i < team.length; i++) {\r\n    for (let j = i + 1; j < team.length; j++) {\r\n      const w = pairMin[team[i]][team[j]] ?? 3.0;\r\n      if (w < worst) worst = w;\r\n    }\r\n  }\r\n  return Number(worst.toFixed(3));\r\n};\r\nconst teamAvgWilling = team => {\r\n  if (team.length < 2) return 5.0;\r\n  let sum = 0, count = 0;\r\n  for (let i = 0; i < team.length; i++) {\r\n    for (let j = i + 1; j < team.length; j++) {\r\n      sum += (pairMin[team[i]][team[j]] ?? 3.0);\r\n      count++;\r\n    }\r\n  }\r\n  return count ? Number((sum / count).toFixed(3)) : 5.0;\r\n};\r\nconst teamWeakestPair = team => {\r\n  if (team.length < 2) return { p1: '', p2: '', score: 5.0 };\r\n  let minScore = 5.0, p1 = team[0], p2 = team[1];\r\n  for (let i = 0; i < team.length; i++) {\r\n    for (let j = i + 1; j < team.length; j++) {\r\n      const w = pairMin[team[i]][team[j]] ?? 3.0;\r\n      if (w < minScore) { minScore = w; p1 = team[i]; p2 = team[j]; }\r\n    }\r\n  }\r\n  return { p1, p2, score: Number(minScore.toFixed(3)) };\r\n};\r\nconst teamVetoCount = team => {\r\n  let count = 0;\r\n  for (let i = 0; i < team.length; i++) {\r\n    for (let j = i + 1; j < team.length; j++) {\r\n      if ((pairMin[team[i]][team[j]] ?? 3.0) <= VETO_THRESHOLD) count++;\r\n    }\r\n  }\r\n  return count;\r\n};\r\nconst teamLowStats = team => {\r\n  let veto = 0, low = 0, sum = 0, n = 0;\r\n  for (let i = 0; i < team.length; i++) {\r\n    for (let j = i + 1; j < team.length; j++) {\r\n      const m = pairMin[team[i]][team[j]] ?? 3.0;\r\n      sum += m; n++;\r\n      if (m <= VETO_THRESHOLD) veto++;\r\n      if (m < WILL_LOW_PAIR) low++;\r\n    }\r\n  }\r\n  return { veto, low };\r\n};\r\nconst teamSpread = team => {\r\n  if (team.length < 2) return 0.0;\r\n  const vals = team.map(n => profiles[n].overall_skill);\r\n  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;\r\n  const variance = vals.reduce((s, v) => s + (v - avg) ** 2, 0) / vals.length;\r\n  return Number(Math.sqrt(variance).toFixed(3));\r\n};\r\nconst teamDimMax = (team, dim) => {\r\n  if (!team.length) return 0;\r\n  return Math.max(...team.map(n => profiles[n].final[dim]));\r\n};\r\n\r\nconst globalAvgSkill = Number((rosterNames.reduce((s, n) => s + profiles[n].overall_skill, 0) / N).toFixed(3));\r\n// Python parity: floor = 10th-percentile overall skill minus 0.3\r\nconst sortedSkills = rosterNames.map(n => profiles[n].overall_skill).sort((a, b) => a - b);\r\nconst MIN_SKILL_FLOOR = Number((sortedSkills[Math.max(0, Math.floor(sortedSkills.length * 0.1))] - 0.3).toFixed(3));\r\n\r\nfunction teamAvgMetrics(teams) {\r\n  const avgs = teams.map(t => teamSkillAvg(t));\r\n  if (!avgs.length) return { avgs, max: 0, min: 0, gap: 0, std: 0, mean: 0 };\r\n  const gap = Number((Math.max(...avgs) - Math.min(...avgs)).toFixed(3));\r\n  const mean = Number((avgs.reduce((a, b) => a + b, 0) / avgs.length).toFixed(3));\r\n  const variance = avgs.reduce((s, v) => s + (v - mean) ** 2, 0) / avgs.length;\r\n  const std = avgs.length > 1 ? Number(Math.sqrt(variance).toFixed(3)) : 0.0;\r\n  return { avgs, max: Number(Math.max(...avgs).toFixed(3)), min: Number(Math.min(...avgs).toFixed(3)), gap, std, mean };\r\n}\r\n\r\nfunction computeLevelsV3Base(teams, relax) {\r\n  let L1 = 0;\r\n  for (const t of teams) {\r\n    const avg = teamSkillAvg(t);\r\n    if (avg < MIN_SKILL_FLOOR) L1 += Number((MIN_SKILL_FLOOR - avg).toFixed(3));\r\n  }\r\n  L1 = Number(L1.toFixed(3));\r\n  let L2 = 0;\r\n  for (const t of teams) {\r\n    const w = teamWorstWilling(t);\r\n    if (w < MIN_WILL_FLOOR) L2 += Number((MIN_WILL_FLOOR - w).toFixed(3));\r\n  }\r\n  L2 = Number(L2.toFixed(3));\r\n  let L3 = 0;\r\n  for (const t of teams) {\r\n    for (const d of TECH_DIMS) {\r\n      if (teamDimMax(t, d) < MIN_DIMENSION_COVERAGE) L3++;\r\n    }\r\n  }\r\n  const L4 = relax.length;\r\n  const avgMetrics = teamAvgMetrics(teams);\r\n  const spreads = teams.map(t => teamSpread(t));\r\n  const L6 = spreads.length ? Number((Math.max(...spreads) - Math.min(...spreads)).toFixed(3)) : 0.0;\r\n  return { L1, L2, L3, L4, L5: avgMetrics.gap, L6, spreads, avg_metrics: avgMetrics };\r\n}\r\n\r\nfunction computeLevels(teams, relax) {\r\n  const base = computeLevelsV3Base(teams, relax);\r\n  let L2V = 0, L2C = 0;\r\n  for (const t of teams) {\r\n    const st = teamLowStats(t);\r\n    L2V += st.veto;\r\n    L2C += st.low;\r\n  }\r\n  let L4 = 0;\r\n  for (const t of teams) {\r\n    const c1 = t.filter(n => profiles[n].tier === 1).length;\r\n    if (c1 > 1) L4 += (c1 - 1);\r\n  }\r\n  return { ...base, L2V, L2C, L4 };\r\n}\r\n\r\n// Exact lexicographic compare (Python tuple compare; no epsilon)\r\nconst levelTup = lv => LEVEL_ORDER.map(o => lv[o]);\r\nconst tupLess = (a, b) => {\r\n  for (let i = 0; i < a.length; i++) {\r\n    if (a[i] < b[i]) return true;\r\n    if (a[i] > b[i]) return false;\r\n  }\r\n  return false;\r\n};\r\n\r\nconst vetoHolds = (a, b) => (pairMin[a]?.[b] ?? 3.0) <= VETO_THRESHOLD;\r\n\r\n// ---- Draft: greedy fallback (Python draft_greedy_simple verbatim) ----\r\nfunction draftGreedySimple(seed) {\r\n  const rnd = MT19937(seed);\r\n  void rnd;\r\n  const teams = Array.from({ length: K }, () => []);\r\n  const bySkillDesc = list => list.slice().sort((a, b) => profiles[b].overall_skill - profiles[a].overall_skill);\r\n  const men = bySkillDesc(rosterNames.filter(n => genderOf[n] === 'M'));\r\n  const women = bySkillDesc(rosterNames.filter(n => genderOf[n] === 'F'));\r\n  const snakeDraft = (pool, slots) => {\r\n    const t = Array.from({ length: K }, () => []);\r\n    const p = pool.slice();\r\n    const maxSlots = slots.length ? Math.max(...slots) : 0;\r\n    for (let r = 0; r < maxSlots; r++) {\r\n      const order = r % 2 === 0\r\n        ? Array.from({ length: K }, (_, i) => i)\r\n        : Array.from({ length: K }, (_, i) => K - 1 - i);\r\n      for (const ti of order) {\r\n        if (t[ti].length >= slots[ti]) continue;\r\n        if (!p.length) break;\r\n        let placed = false;\r\n        for (let ci = 0; ci < p.length; ci++) {\r\n          const cand = p[ci];\r\n          let veto = false;\r\n          for (const existing of [...teams[ti], ...t[ti]]) {\r\n            if (vetoHolds(cand, existing)) { veto = true; break; }\r\n          }\r\n          if (!veto) { t[ti].push(p.splice(ci, 1)[0]); placed = true; break; }\r\n        }\r\n        if (!placed && p.length) t[ti].push(p.shift());\r\n      }\r\n    }\r\n    return t;\r\n  };\r\n  const menTeams = snakeDraft(men, mSlots);\r\n  const womenTeams = snakeDraft(women, fSlots);\r\n  for (let i = 0; i < K; i++) teams[i] = [...menTeams[i], ...womenTeams[i]];\r\n  return [teams, []];\r\n}\r\n\r\n// ---- Draft: toxicity-first penalty draft (Python draft_v4 verbatim) ----\r\nfunction draftV4(seed) {\r\n  buildTiers(mSlots, fSlots);\r\n  const teams = Array.from({ length: K }, () => []);\r\n  const gmean = rosterNames.reduce((s, n) => s + profiles[n].overall_skill, 0) / rosterNames.length;\r\n  const degree = {};\r\n  for (const a of rosterNames) {\r\n    degree[a] = rosterNames.filter(b => a !== b && (pairMin[a]?.[b] ?? 3.0) <= VETO_THRESHOLD).length;\r\n  }\r\n  const rnd = MT19937(seed);\r\n  const keyed = rosterNames.map((n, i) => [n, rnd.random(), i]);\r\n  keyed.sort((a, b) => {\r\n    const dd = degree[b[0]] - degree[a[0]];\r\n    if (dd !== 0) return dd;\r\n    const sd = profiles[b[0]].overall_skill - profiles[a[0]].overall_skill;\r\n    if (sd !== 0) return sd;\r\n    if (a[1] < b[1]) return -1;\r\n    if (a[1] > b[1]) return 1;\r\n    return a[2] - b[2];\r\n  });\r\n  const order = keyed.map(e => e[0]);\r\n  for (const name of order) {\r\n    const g = genderOf[name];\r\n    const cands = [];\r\n    for (let ti = 0; ti < K; ti++) {\r\n      const curM = teams[ti].filter(n => genderOf[n] === 'M').length;\r\n      const curF = teams[ti].length - curM;\r\n      if (g === 'M' && curM >= mSlots[ti]) continue;\r\n      if (g === 'F' && curF >= fSlots[ti]) continue;\r\n      if (teams[ti].length >= mSlots[ti] + fSlots[ti]) continue;\r\n      let addVeto = 0, addLow = 0, willSum = 0;\r\n      for (const e of teams[ti]) {\r\n        const w = pairMin[name]?.[e] ?? 3.0;\r\n        if (vetoHolds(name, e)) addVeto++;\r\n        if (w < WILL_LOW_PAIR) addLow++;\r\n        willSum += w;\r\n      }\r\n      const nteam = teams[ti].length;\r\n      const tavg = nteam\r\n        ? teams[ti].reduce((s, n) => s + profiles[n].overall_skill, 0) / nteam\r\n        : gmean;\r\n      const newAvg = (tavg * nteam + profiles[name].overall_skill) / (nteam + 1);\r\n      const skillDev = Math.abs(newAvg - gmean);\r\n      const wavg = nteam ? willSum / nteam : 5.0;\r\n      cands.push([[addVeto * 100.0 + addLow * 10.0 + skillDev * 2.0 - wavg * 0.5, rnd.random()], ti]);\r\n    }\r\n    if (!cands.length) {\r\n      for (let ti = 0; ti < K; ti++) {\r\n        if (teams[ti].length < mSlots[ti] + fSlots[ti]) {\r\n          let addVeto = 0;\r\n          for (const e of teams[ti]) if (vetoHolds(name, e)) addVeto++;\r\n          cands.push([[addVeto, rnd.random()], ti]);\r\n        }\r\n      }\r\n    }\r\n    cands.sort((a, b) =>\r\n      (a[0][0] - b[0][0]) ||\r\n      (a[0][1] < b[0][1] ? -1 : a[0][1] > b[0][1] ? 1 : 0) ||\r\n      (a[1] - b[1]));\r\n    teams[cands[0][1]].push(name);\r\n  }\r\n  return [teams, []];\r\n}\r\n\r\n// ---- Refinement: steepest descent, first improving 2x2 per pair (Python refinement_v4 verbatim) ----\r\nfunction refinement(teamsIn, relaxIn) {\r\n  let teams = teamsIn.map(t => [...t]);\r\n  const relax = relaxIn.slice();\r\n  const swapLog = [];\r\n  let cur = computeLevels(teams, relax);\r\n  const pyPair = (a, b) => `('${a}', '${b}')`;\r\n  for (let p = 1; p <= MAX_PASSES; p++) {\r\n    let best = null, bestLv = null, bestNt = null;\r\n    for (let a = 0; a < teams.length; a++) {\r\n      for (let b = a + 1; b < teams.length; b++) {\r\n        for (const ma of teams[a].slice()) {\r\n          for (const mb of teams[b].slice()) {\r\n            if (genderOf[ma] !== genderOf[mb]) continue;\r\n            const nt = teams.map(t => [...t]);\r\n            nt[a] = nt[a].filter(n => n !== ma); nt[a].push(mb);\r\n            nt[b] = nt[b].filter(n => n !== mb); nt[b].push(ma);\r\n            const lv = computeLevels(nt, relax);\r\n            if (tupLess(levelTup(lv), levelTup(cur))) {\r\n              if (bestLv === null || tupLess(levelTup(lv), levelTup(bestLv))) {\r\n                best = [a, b, ma, mb, 'swap']; bestLv = lv; bestNt = nt;\r\n              }\r\n            }\r\n          }\r\n        }\r\n        const maM = teams[a].filter(n => genderOf[n] === 'M');\r\n        const maF = teams[a].filter(n => genderOf[n] === 'F');\r\n        const mbM = teams[b].filter(n => genderOf[n] === 'M');\r\n        const mbF = teams[b].filter(n => genderOf[n] === 'F');\r\n        for (const xa of maM) {\r\n          for (const xb of mbM) {\r\n            for (const ya of maF) {\r\n              for (const yb of mbF) {\r\n                const nt = teams.map(t => [...t]);\r\n                nt[a] = nt[a].filter(n => n !== xa && n !== ya); nt[a].push(xb, yb);\r\n                nt[b] = nt[b].filter(n => n !== xb && n !== yb); nt[b].push(xa, ya);\r\n                const lv = computeLevels(nt, relax);\r\n                if (tupLess(levelTup(lv), levelTup(cur))) {\r\n                  if (bestLv === null || tupLess(levelTup(lv), levelTup(bestLv))) {\r\n                    best = [a, b, [xa, ya], [xb, yb], 'swap2x2']; bestLv = lv; bestNt = nt;\r\n                    break;\r\n                  }\r\n                }\r\n              }\r\n            }\r\n          }\r\n        }\r\n      }\r\n    }\r\n    if (best === null) break;\r\n    const [a, b, ma, mb, kind] = best;\r\n    teams = bestNt;\r\n    cur = bestLv;\r\n    swapLog.push({\r\n      pass: p, teams: [a + 1, b + 1],\r\n      swapped: [Array.isArray(ma) ? pyPair(ma[0], ma[1]) : ma,\r\n                Array.isArray(mb) ? pyPair(mb[0], mb[1]) : mb],\r\n      level: kind, before: '', after: '(' + levelTup(bestLv).join(', ') + ')',\r\n    });\r\n  }\r\n  return { teams, swapLog, relax };\r\n}\r\n\r\n// ---- Outcome classification (Python classify_outcome verbatim) ----\r\nfunction classifyOutcome(teams, relax) {\r\n  const lv = computeLevels(teams, relax);\r\n  const avgV = lv.L5 > TEAM_AVG_GAP_THRESHOLD;\r\n  const spreadV = lv.L6 > SPREAD_GAP_THRESHOLD;\r\n  const remaining = [];\r\n  if (lv.L1 !== 0) remaining.push({ level: 'L1_skill_floor', magnitude: lv.L1 });\r\n  if (lv.L2V !== 0) remaining.push({ level: 'L2V_veto_count', magnitude: lv.L2V });\r\n  if (lv.L2 !== 0) remaining.push({ level: 'L2_will_floor', magnitude: lv.L2 });\r\n  if (lv.L2C !== 0) remaining.push({ level: 'L2C_low_pairs', magnitude: lv.L2C });\r\n  if (lv.L3 !== 0) remaining.push({ level: 'L3_specialization', magnitude: lv.L3 });\r\n  if (avgV) remaining.push({ level: 'L5_team_avg_gap', magnitude: lv.L5 });\r\n  if (spreadV) remaining.push({ level: 'L6_spread_gap', magnitude: lv.L6 });\r\n  if (lv.L4 !== 0) remaining.push({ level: 'L4_tier_stacking', magnitude: lv.L4 });\r\n  let status;\r\n  if (!remaining.length && !relax.length) status = 'FEASIBLE';\r\n  else if (!remaining.length) status = 'FEASIBLE_WITH_RELAXATION';\r\n  else if (remaining.length) status = 'FEASIBLE_WITH_REMAINING_SOFT_VIOLATIONS';\r\n  else status = 'FEASIBLE';\r\n  return { status, levels: lv, remaining };\r\n}\r\n\r\n// ---- Main multi-start loop (Python v4 main verbatim; raw tuple selection) ----\r\nlet bestTup = null, bestLevels = null, bestPack = null;\r\nfor (let s = 0; s < NUM_STARTS; s++) {\r\n  const seed = RANDOM_SEED + s * 997;\r\n  let teamsTry, relaxTry;\r\n  try {\r\n    [teamsTry, relaxTry] = draftV4(seed);\r\n  } catch (e) {\r\n    if (!(e instanceof InfeasibleError)) throw e;\r\n    [teamsTry, relaxTry] = draftGreedySimple(seed);\r\n    relaxTry.push({\r\n      team: 0, tier_substituted: 0, adjacent_tier_used: 0, person_placed: 'fallback',\r\n      reason: `Tier draft infeasible (${e.reason}) -> greedy fallback used`,\r\n    });\r\n  }\r\n  const refined = refinement(teamsTry, relaxTry);\r\n  const lv = computeLevels(refined.teams, refined.relax);\r\n  const tup = levelTup(lv);\r\n  if (bestTup === null || tupLess(tup, bestTup)) {\r\n    bestTup = tup;\r\n    bestLevels = lv;\r\n    bestPack = { teams: refined.teams, swapLog: refined.swapLog, relax: refined.relax, lv };\r\n  }\r\n}\r\nconst currentTeams = bestPack.teams;\r\nconst currentLevels = bestPack.lv;\r\nconst swapLog = bestPack.swapLog;\r\nconst tierRelaxations = bestPack.relax;\r\nconst totalSwaps = swapLog.length;\r\nconst classified = classifyOutcome(currentTeams, tierRelaxations);\r\n\r\n// 6. Calculate Team Fairness Scores & Grades (0-100 scale, n8n-only extra)\r\nconst assignments = [];\r\nconst teamMetrics = [];\r\n\r\nfor (let k = 0; k < K; k++) {\r\n  const teamId = `Team ${k + 1}`;\r\n  const members = currentTeams[k];\r\n  const avg = teamSkillAvg(members);\r\n  const total = Number(members.reduce((sum, n) => sum + profiles[n].overall_skill, 0).toFixed(3));\r\n  const worstW = teamWorstWilling(members);\r\n  const avgW = teamAvgWilling(members);\r\n  const weakest = teamWeakestPair(members);\r\n  const vetoes = teamVetoCount(members);\r\n  const lows = teamLowStats(members).low;\r\n  const spread = teamSpread(members);\r\n  const mCount = members.filter(n => genderOf[n] === 'M').length;\r\n  const fCount = members.length - mCount;\r\n\r\n  // Fairness Scoring Formula (from gen_fairness_audit.py)\r\n  const dev = Math.abs(avg - globalAvgSkill);\r\n  const penalty = (vetoes * 22) + (worstW < 2.5 ? 12 : 0) + (lows * 4) + (dev * 28) + (Math.max(0, spread - 0.35) * 30) + (Math.max(0, 2.8 - avgW) * 6);\r\n  const fairnessScore = Math.round(Math.max(0, Math.min(100, 100 - penalty)));\r\n  const fairnessGrade = fairnessScore >= 85 ? 'A' : fairnessScore >= 70 ? 'B' : fairnessScore >= 50 ? 'C' : fairnessScore >= 35 ? 'D' : 'F';\r\n\r\n  const flags = [];\r\n  if (vetoes > 0) flags.push(`VETO x${vetoes}`);\r\n  if (worstW < 2.5) flags.push(`LOW_WILLING (${worstW})`);\r\n  if (lows > 0) flags.push(`LOW_PAIRS x${lows}`);\r\n  if (dev > 0.25) flags.push(avg > globalAvgSkill ? 'STACKED' : 'WEAK');\r\n  if (spread > 0.40) flags.push('SPREAD_HIGH');\r\n  if (!flags.length) flags.push('OPTIMAL');\r\n\r\n  teamMetrics.push({\r\n    team_id: teamId,\r\n    team_size: members.length,\r\n    team_male_count: mCount,\r\n    team_female_count: fCount,\r\n    team_average_skill: avg,\r\n    team_total_skill: total,\r\n    team_worst_willingness: worstW,\r\n    team_avg_willingness: avgW,\r\n    weakest_pair: `${weakest.p1} & ${weakest.p2} (${weakest.score})`,\r\n    team_veto_count: vetoes,\r\n    team_low_pair_count: teamLowStats(members).low,\r\n    team_spread: spread,\r\n    fairness_score: fairnessScore,\r\n    fairness_grade: fairnessGrade,\r\n    status_flags: flags.join(', '),\r\n  });\r\n\r\n  for (const name of members) {\r\n    const prof = profiles[name];\r\n    assignments.push({\r\n      run_id: input.runId,\r\n      team_id: teamId,\r\n      member_display_name: name,\r\n      gender: prof.gender,\r\n      tier: prof.tier ?? 2,\r\n      tier_label: prof.tierLabel ?? 'Tier 2',\r\n      overall_skill: prof.overall_skill,\r\n      devops_skill: prof.final.devops,\r\n      ai_ml_skill: prof.final.ai_ml,\r\n      technical_skill: prof.final.technical,\r\n      involvement_skill: prof.final.involvement,\r\n      team_average_skill: avg,\r\n      team_total_skill: total,\r\n      team_size: members.length,\r\n      team_male_count: mCount,\r\n      team_female_count: fCount,\r\n      team_worst_willingness: worstW,\r\n      team_avg_willingness: avgW,\r\n      weakest_pair: `${weakest.p1} & ${weakest.p2} (${weakest.score})`,\r\n      fairness_score: fairnessScore,\r\n      fairness_grade: fairnessGrade,\r\n      status_flags: flags.join(', '),\r\n    });\r\n  }\r\n}\r\n\r\nconst allAssigned = assignments.map(a => a.member_display_name);\r\nconst uniqueAssigned = new Set(allAssigned);\r\nif (uniqueAssigned.size !== N) {\r\n  throw new Error(`Assignment validation failed: ${uniqueAssigned.size} unique members vs ${N} total`);\r\n}\r\n\r\n// Overall Class Fairness Score (0-100)\r\nconst overallGap = currentLevels.L5;\r\nconst overallFairnessPenalty = (currentLevels.L2V * 15) + (currentLevels.L2 * 10) + (currentLevels.L2C * 5) + (overallGap * 30) + (currentLevels.L6 * 18);\r\nconst overallFairnessScore = Math.round(Math.max(0, Math.min(100, 100 - overallFairnessPenalty)));\r\nconst overallFairnessGrade = overallFairnessScore >= 85 ? 'A' : overallFairnessScore >= 70 ? 'B' : overallFairnessScore >= 50 ? 'C' : overallFairnessScore >= 35 ? 'D' : 'F';\r\n\r\nconst audit = {\r\n  run_id: input.runId,\r\n  solver_status: classified.status,\r\n  solver_version: 'FairMatch-v4-Lexicographic-JS',\r\n  overall_fairness_score: overallFairnessScore,\r\n  overall_fairness_grade: overallFairnessGrade,\r\n  team_count: K,\r\n  total_members: N,\r\n  total_males: totalM,\r\n  total_females: totalF,\r\n  refinement_swaps: totalSwaps,\r\n  swap_log: swapLog,\r\n  tier_relaxations: tierRelaxations,\r\n  remaining: classified.remaining,\r\n  levels: currentLevels,\r\n  team_avg_gap: currentLevels.L5,\r\n  global_avg_skill: globalAvgSkill,\r\n  veto_pairs_total: vetoPairs.length,\r\n  veto_pairs_in_teams: currentLevels.L2V,\r\n  hard_constraints_passed: {\r\n    assigned_once: uniqueAssigned.size === N,\r\n    team_sizes: teamMetrics.every((m, i) => m.team_size === teamSizes[i]),\r\n    gender_balanced: teamMetrics.every((m, i) => m.team_male_count === mSlots[i] && m.team_female_count === fSlots[i]),\r\n    no_intra_team_veto: currentLevels.L2V === 0,\r\n  }\r\n};\r\n\r\nreturn [{\r\n  json: {\r\n    run_id: input.runId,\r\n    assignments,\r\n    team_metrics: teamMetrics,\r\n    audit,\r\n    diagnostics: input.diagnostics,\r\n    metadata: input.metadata,\r\n  }\r\n}];\r\n"
+      },
+      "id": "cd10f1be-dd8c-433f-ae70-aee0d70d35c3",
+      "name": "FairMatch Solver Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Format Beautiful, High-Impact Output Rows for Google Sheets & Excel\nconst input = items[0].json;\nconst generatedAt = new Date().toISOString();\n\n// Sort assignments: First by Team Number (1, 2, 3, 4), then by Overall Skill descending\nconst sortedAssignments = [...input.assignments].sort((a, b) => {\n  const teamA = parseInt(a.team_id.replace(/\\D/g, ''), 10) || 0;\n  const teamB = parseInt(b.team_id.replace(/\\D/g, ''), 10) || 0;\n  if (teamA !== teamB) return teamA - teamB;\n  return (b.overall_skill || 0) - (a.overall_skill || 0);\n});\n\nconst teamRows = sortedAssignments.map(a => {\n  const mCount = a.team_male_count ?? 0;\n  const fCount = a.team_female_count ?? 0;\n  \n  return {\n    \"Team\": a.team_id,\n    \"Fairness Grade\": `Grade ${a.fairness_grade} (${a.fairness_score}/100)`,\n    \"Member Name\": a.member_display_name,\n    \"Gender\": a.gender === 'M' ? 'Male (M)' : 'Female (F)',\n    \"Skill Tier\": a.tier_label || `Tier ${a.tier}`,\n    \"Overall Skill\": Number((a.overall_skill || 0).toFixed(2)),\n    \"DevOps Skill\": Number((a.devops_skill || 0).toFixed(2)),\n    \"AI / ML Skill\": Number((a.ai_ml_skill || 0).toFixed(2)),\n    \"Technical Skill\": Number((a.technical_skill || 0).toFixed(2)),\n    \"Involvement\": Number((a.involvement_skill || 0).toFixed(2)),\n    \"Team Average Skill\": Number((a.team_average_skill || 0).toFixed(2)),\n    \"Team Total Skill\": Number((a.team_total_skill || 0).toFixed(2)),\n    \"Team Gender Ratio\": `${mCount}M / ${fCount}F`,\n    \"Avg Team Willingness\": Number((a.team_avg_willingness ?? 3.0).toFixed(2)),\n    \"Min Team Compatibility\": Number((a.team_worst_willingness ?? 3.0).toFixed(2)),\n    \"Weakest Team Pair\": a.weakest_pair || 'N/A',\n    \"Intra-Team Vetoes\": (a.team_veto_count ?? 0) === 0 ? \"0 (Veto-Free)\" : `${a.team_veto_count} (NEEDS REVIEW)`,\n    \"Status Flags\": a.status_flags || 'OPTIMAL',\n    \"Run ID\": a.run_id,\n    \"Generated At\": generatedAt,\n  };\n});\n\n// Summary rows for a clean overview / dashboard\nconst teamSummaryRows = (input.team_metrics || []).map(m => ({\n  \"Team\": m.team_id,\n  \"Fairness Grade\": `Grade ${m.fairness_grade} (${m.fairness_score}/100)`,\n  \"Team Size\": m.team_size,\n  \"Gender Breakdown\": `${m.team_male_count} Males / ${m.team_female_count} Females`,\n  \"Average Skill\": Number(m.team_average_skill.toFixed(2)),\n  \"Total Skill\": Number(m.team_total_skill.toFixed(2)),\n  \"Skill Spread (StdDev)\": Number(m.team_spread.toFixed(2)),\n  \"Avg Teammate Willingness\": Number(m.team_avg_willingness.toFixed(2)),\n  \"Min Compatibility\": Number(m.team_worst_willingness.toFixed(2)),\n  \"Weakest Internal Pair\": m.weakest_pair,\n  \"Veto Count\": m.team_veto_count,\n  \"Low Compatibility Count\": m.team_low_pair_count,\n  \"Status\": (m.status_flags || 'OPTIMAL').split(', ').join(' • ')\n}));\n\n// Python float repr parity: ints print as \"5.0\", others as-is\nconst pyFloat = v => (typeof v === 'number' && Number.isInteger(v)) ? `${v}.0` : String(v);\nconst fmtMag = (level, v) => (['L1', 'L2', 'L5', 'L6'].includes(level) ? pyFloat(v) : String(v));\n\nconst reviewRows = [];\nfor (const s of (input.audit.swap_log || [])) {\n  reviewRows.push({\n    Type: 'swap_made',\n    Detail: `Pass ${s.pass} Teams ${s.teams[0]}<->${s.teams[1]} ${s.swapped[0]}<->${s.swapped[1]} level ${s.level} ${s.before}->${s.after}`,\n  });\n}\nfor (const tr of (input.audit.tier_relaxations || [])) {\n  reviewRows.push({\n    Type: 'tier_relaxation',\n    Detail: `Team ${tr.team} tier ${tr.tier_substituted}->adj ${tr.adjacent_tier_used} ${tr.person_placed} : ${tr.reason}`,\n  });\n}\nfor (const rv of (input.audit.remaining || [])) {\n  reviewRows.push({\n    Type: 'remaining_soft_violation',\n    Detail: `${rv.level} magnitude ${fmtMag(rv.level.split('_')[0], rv.magnitude)}`,\n  });\n}\nfor (const d of (input.diagnostics.disagreements || [])) {\n  reviewRows.push({\n    Type: 'disagreement_flag',\n    Detail: `${d.person} ${d.dim} self ${pyFloat(d.self)} peer ${pyFloat(d.peer)} gap ${pyFloat(d.gap)} ${d.flag}`,\n  });\n}\nfor (const rc of (input.diagnostics.rater_consistency || [])) {\n  reviewRows.push({\n    Type: 'rater_consistency_flag',\n    Detail: `${rc.rater} corr ${rc.correlation} n ${rc.n}`,\n  });\n}\nfor (const lf of (input.diagnostics.low_flags || [])) {\n  reviewRows.push({ Type: 'low_confidence', Detail: lf });\n}\nreviewRows.push({ Type: 'levels', Detail: JSON.stringify(input.audit.levels) });\nreviewRows.push({ Type: 'status', Detail: input.audit.solver_status });\n\nconst auditRows = [{\n  \"Run ID\": input.run_id,\n  \"Overall Fairness\": `Score ${input.audit.overall_fairness_score}/100 (Grade ${input.audit.overall_fairness_grade})`,\n  \"Solver Status\": input.audit.solver_status,\n  \"Solver Version\": input.audit.solver_version,\n  \"Total Teams Formed\": input.audit.team_count,\n  \"Total Participants\": input.audit.total_members,\n  \"Gender Balance\": `${input.audit.total_males} Males / ${input.audit.total_females} Females`,\n  \"Team Skill Gap (Max - Min)\": Number((input.audit.levels.L5 || 0).toFixed(2)),\n  \"Global Average Skill\": Number((input.audit.global_avg_skill || 0).toFixed(2)),\n  \"Intra-Team Veto Violations\": input.audit.levels.L2V,\n  \"Intra-Team Low Pairs\": input.audit.levels.L2C,\n  \"Self-Disagreements Corrected\": (input.diagnostics.disagreements || []).length,\n  \"Non-Submitters Imputed\": (input.diagnostics.missing_submitters || []).length,\n  \"Generated At\": generatedAt,\n}];\n\nreturn [{\n  json: {\n    teamRows,\n    teamSummaryRows,\n    auditRows,\n    reviewRows,\n    teamMetrics: input.team_metrics,\n    auditSummary: input.audit,\n    diagnostics: input.diagnostics,\n  }\n}];\n"
+      },
+      "id": "738a7f49-b805-4814-9207-30e51e11bcd5",
+      "name": "Format Results for Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Build single 2D values matrix for one-shot Sheets update/append\n// Input: Format Results output (teamRows). Output: ONE item with full matrix.\nconst rows = items[0].json.teamRows || [];\nconst header = [\n  \"Team\", \"Fairness Grade\", \"Member Name\", \"Gender\", \"Skill Tier\",\n  \"Overall Skill\", \"DevOps Skill\", \"AI / ML Skill\", \"Technical Skill\", \"Involvement\",\n  \"Team Average Skill\", \"Team Total Skill\", \"Team Gender Ratio\",\n  \"Avg Team Willingness\", \"Min Team Compatibility\", \"Weakest Team Pair\",\n  \"Intra-Team Vetoes\", \"Status Flags\", \"Run ID\", \"Generated At\"\n];\nconst values = [header, ...rows.map(r => header.map(h => (r[h] ?? \"\")))];\nreturn [{ json: { values, rowCount: rows.length } }];\n"
+      },
+      "id": "58d84128-a39b-48f4-b659-44b899d1a4a9",
+      "name": "Build Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_GOOGLE_SHEET_ID/values/Teams_HTTP!A1:T25:append?valueInputOption=USER_ENTERED",
+        "authentication": "predefinedCredentialType",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": {
+          "values": "={{ $json.values }}"
+        },
+        "options": {}
+      },
+      "id": "f853c276-072c-4277-90bd-e20faadfb9c2",
+      "name": "HTTP Append Teams",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Build single 2D values matrix for team-level summary.\n// Input: Format Results output (teamSummaryRows). Output: ONE item, no individual rows.\nconst rows = items[0].json.teamSummaryRows || [];\nconst members = items[0].json.teamRows || [];\nconst byTeam = {};\nfor (const m of members) {\n  (byTeam[m.Team] = byTeam[m.Team] || []).push(m[\"Member Name\"]);\n}\nconst header = [\n  \"Team\", \"Fairness Grade\", \"Team Size\", \"Gender Breakdown\", \"Members\",\n  \"Average Skill\", \"Total Skill\", \"Skill Spread (StdDev)\",\n  \"Avg Teammate Willingness\", \"Min Compatibility\", \"Weakest Internal Pair\",\n  \"Veto Count\", \"Low Compatibility Count\", \"Status\"\n];\nconst values = [header, ...rows.map(r => header.map(h => (\n  h === \"Members\" ? (byTeam[r.Team] || []).join(\", \") : (r[h] ?? \"\")\n)))];\nreturn [{ json: { values, rowCount: rows.length } }];\n"
+      },
+      "id": "451ae939-aeac-4390-ad2e-86ada05f0c0e",
+      "name": "Build Summary Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_GOOGLE_SHEET_ID/values/Teams_Summary!A1:M5:append?valueInputOption=USER_ENTERED",
+        "authentication": "predefinedCredentialType",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": {
+          "values": "={{ $json.values }}"
+        },
+        "options": {}
+      },
+      "id": "db17238e-0c48-43bc-a8ec-9f7c88d60ae5",
+      "name": "HTTP Append Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "title": "Teams_Summary",
+        "options": {},
+        "resource": "sheet",
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Teams_Summary"
+        }
+      },
+      "id": "88a1a246-a8e7-4482-bb9e-c290e9d4f7f7",
+      "name": "Ensure Summary Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -224,
+        496
+      ],
+      "disabled": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "a7945f33-6f8c-45ed-8a81-3c98aa8e3c45",
+      "name": "Build Flat Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// n8n Code node: Build gap-filled flat responses matrix (auditable clean dataset).\n// Input: Clean output ({flatResponses}). Output: ONE item { values }.\n// Columns: Rater | Target | Type | DevOps | AI/ML | Technical | Involvement |\n// Willingness | Imputed | Run ID. Imputed rows cover the 2 non-submitters.\nconst flat = items[0].json.flatResponses || [];\nconst runId = items[0].json.runId || '';\nconst header = [\n  \"Rater\", \"Target\", \"Type\", \"DevOps\", \"AI / ML\", \"Technical\",\n  \"Involvement\", \"Willingness\", \"Imputed\", \"Run ID\"\n];\nconst values = [header, ...flat.map(r => [\n  r.rater, r.target, r.rater === r.target ? \"self\" : \"peer\",\n  r.devops, r.ai_ml, r.technical, r.involvement, r.willing,\n  r.is_imputed ? \"YES\" : \"NO\", runId\n])];\nreturn [{ json: { values, rowCount: flat.length } }];\n"
+      }
+    },
+    {
+      "id": "ec10176e-352a-4a08-b09d-46d9670d89c4",
+      "name": "HTTP Append Flat",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_GOOGLE_SHEET_ID/values/Responses_Clean!A1:J578:append?valueInputOption=USER_ENTERED",
+        "authentication": "predefinedCredentialType",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": {
+          "values": "={{ $json.values }}"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "fba1cd33-fd63-48da-8a9a-1042eafe38aa",
+      "name": "Ensure Flat Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "create",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "title": "Responses_Clean",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Read Raw Responses": {
+      "main": [
+        [
+          {
+            "node": "Clean and Normalize Responses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean and Normalize Responses": {
+      "main": [
+        [
+          {
+            "node": "FairMatch Solver Engine",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Flat Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FairMatch Solver Engine": {
+      "main": [
+        [
+          {
+            "node": "Format Results for Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Results for Output": {
+      "main": [
+        [
+          {
+            "node": "Build Matrix",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Summary Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Matrix": {
+      "main": [
+        [
+          {
+            "node": "HTTP Append Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Summary Matrix": {
+      "main": [
+        [
+          {
+            "node": "HTTP Append Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Flat Matrix": {
+      "main": [
+        [
+          {
+            "node": "HTTP Append Flat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Ensure Flat Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure Flat Sheet": {
+      "main": [
+        [
+          {
+            "node": "Read Raw Responses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
+
+
+
