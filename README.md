@@ -17,10 +17,16 @@ avoidance, skill coverage, fairness scoring, and an audit trail built in.
 
 ## ✨ What it does
 
-FairMatch is an n8n workflow for building teams from peer-review and
-self-assessment data. It is designed for real-world input: duplicate
-submissions, malformed JSON, mixed rating scales, missing respondents, and
-incomplete peer ratings are treated as normal operating conditions.
+FairMatch is an n8n workflow for building teams from Google Form responses.
+The form collects self-assessments and peer scores, sends the responses into
+an Excel/Google Sheet, and n8n reads that sheet to produce balanced teams.
+Its central job is turning inconsistent human scoring into comparable data:
+different questions may use different scales, including mixed 1–5 and 1–10
+ratings.
+
+It is designed for real-world input: duplicate submissions, malformed JSON,
+missing respondents, and incomplete peer ratings are treated as normal
+operating conditions.
 
 The result is more than a roster. Every run produces team assignments,
 metrics, diagnostics, and fairness/audit data that can be reviewed before the
@@ -30,22 +36,26 @@ results are written back to a spreadsheet.
 
 ```mermaid
 flowchart LR
-    A[📥 Raw survey rows] --> B[🧹 Clean & normalize]
-    B --> C[🧠 FairMatch solver]
-    C --> D[📊 Format results]
-    D --> E[📝 Build matrices]
-    E --> F[📗 Google Sheets / downstream]
+    A[📝 Google Form] --> B[📗 Excel / Google Sheet]
+    B --> C[🔗 n8n Sheets input]
+    C --> D[🧹 Clean & normalize]
+    D --> E[🧠 FairMatch solver]
+    E --> F[📊 Format results]
+    F --> G[📝 Build matrices]
+    G --> H[📗 Results sheet / downstream]
 
-    B -. diagnostics .-> G[🔍 Audit trail]
-    C -. constraint levels .-> G
+    D -. diagnostics .-> I[🔍 Audit trail]
+    E -. constraint levels .-> I
 
     style A fill:#172554,stroke:#60a5fa,color:#fff
-    style B fill:#312e81,stroke:#a78bfa,color:#fff
-    style C fill:#064e3b,stroke:#34d399,color:#fff
+    style B fill:#064e3b,stroke:#34d399,color:#fff
+    style C fill:#312e81,stroke:#a78bfa,color:#fff
     style D fill:#164e63,stroke:#22d3ee,color:#fff
     style E fill:#713f12,stroke:#fbbf24,color:#fff
     style F fill:#3f1d4f,stroke:#e879f9,color:#fff
-    style G fill:#374151,stroke:#9ca3af,color:#fff
+    style G fill:#3f1d4f,stroke:#e879f9,color:#fff
+    style H fill:#064e3b,stroke:#34d399,color:#fff
+    style I fill:#374151,stroke:#9ca3af,color:#fff
 ```
 
 ## 🎯 What the solver optimizes
@@ -71,7 +81,8 @@ a fixed seed for repeatable results under the same input and configuration.
 
 - **Deduplicates submissions** and keeps the latest response per person.
 - **Parses resiliently** across structured objects and escaped JSON payloads.
-- **Normalizes rating scales** when inputs mix 1–5 and 1–10 responses.
+- **Normalizes form scoring scales** when questions or submissions mix 1–5 and
+  1–10 responses, so scores can be compared fairly.
 - **Imputes missing respondents** from peer consensus when an explicit roster is configured.
 - **Detects self/peer disagreement** and records the decision in diagnostics.
 - **Builds mutual willingness** from the lower of the two directed ratings.
@@ -80,19 +91,26 @@ a fixed seed for repeatable results under the same input and configuration.
 
 ## 🚀 Quick start
 
-### 1. Import the sanitized template
+### 1. Collect responses in the form
+
+Use a Google Form to collect self-scores, skill scores, and willingness/fit
+scores from participants. The form responses land in an Excel or Google Sheet,
+which becomes the workflow’s input table.
+
+### 2. Import the sanitized template
 
 Import [`n8n/fairmatch_template.json`](n8n/fairmatch_template.json) into n8n.
 It contains no production credentials, participant data, or live spreadsheet
 identifiers.
 
-### 2. Configure private deployment details
+### 3. Connect the response sheet to n8n
 
-Set the roster and connect Google Sheets inside your private n8n instance.
+Set the response-sheet connection, roster, and output sheets inside your private
+n8n instance.
 Read [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) before wiring inputs or
 outputs.
 
-### 3. Run and inspect
+### 4. Run and inspect
 
 Run the workflow with representative input, review the audit output, then
 enable downstream writes. Keep production data and credentials out of Git;
@@ -117,8 +135,8 @@ see [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## 📥 Expected input shape
 
-Each n8n item should provide a display name and gender, plus either structured
-survey fields or a JSON payload:
+Each row read from the form response sheet should provide a display name and
+gender, plus structured survey fields or a JSON payload:
 
 ```json
 {
@@ -135,8 +153,10 @@ survey fields or a JSON payload:
 }
 ```
 
-The normalizer also accepts `email`, `Email`, or `payload` when the survey is
-stored as a JSON string.
+The normalizer also accepts `email`, `Email`, or `payload` when the form survey
+is stored as a JSON string. Numeric values can arrive on different rating
+scales; the cleaning stage detects the observed scale and maps values onto a
+common 1–5 basis before scoring.
 
 ## 📤 Output highlights
 
