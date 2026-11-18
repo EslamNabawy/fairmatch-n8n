@@ -1,0 +1,48 @@
+# Local/runtime artifacts
+__pycache__/
+.claude/
+.env
+.env.*
+*.log
+
+# Private source data and generated outputs
+private/
+data/raw/
+data/output/
+*.xlsx
+*.xls
+*.html
+*_backup*.json
+live_results.json
+pipeline_results.json
+final_args.json
+mcp_*.json
+update_ops.json
+
+# Local-only scripts and scratch work
+draft_*.js
+preview_*.js
+build_*.py
+create_update_payload.py
+rebuild_complete_workflow.py
+sync_bundle.py
+push_nodes.py
+flat_setup.py
+http_setup.py
+summary_setup.py
+summary_cycle.py
+update_better_output.py
+city_weather_*
+fish_sea_*
+dashboard_*
+parity_eval_py.py
+verify_algorithm.py
+test_enhanced_audit.py
+test_js_cleaner.py
+test_solver_simulation.py
+verify_nodes.py
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
