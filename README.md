@@ -171,15 +171,27 @@ Each run can expose:
 
 ## ✅ Verification
 
-The repository has no runtime dependency installation step. Syntax-check the
-Code nodes locally with:
+The repository has no production runtime dependency installation step.
+Syntax-check the standalone Code-node files locally with:
 
 ```powershell
 Get-ChildItem n8n -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
 
-The n8n runtime supplies `items`; Code nodes are intended to run inside n8n or
-through a dedicated harness, not as standalone Node.js programs.
+For the pinned workflow export's actual cleaning and solver nodes, run the
+synthetic JavaScript/Python parity check (Python 3.11+ and Node.js 24.x):
+
+```powershell
+python -m unittest discover -s verification -p 'test_*.py'
+python verification/run_parity.py
+```
+
+The harness extracts Code nodes from `n8n/fairmatch_template.json`, verifies
+their source hashes, and compares three synthetic scenarios with the included
+Python v4 reference. It checks latest-submission deduplication, team membership,
+solver status, constraint levels, and hard constraints. The generated report is
+`verification/PARITY_REPORT.txt`. This is a new synthetic verification; it does
+not prove a historical comparison or production recovery.
 
 ## 🔐 Public-repository boundary
 

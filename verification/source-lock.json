@@ -1,0 +1,12 @@
+{
+  "workflow_commit": "62c1fd4e1c3fc90a1d97f5714296824017d322a4",
+  "workflow_sha256": "bbc9834e5f6785895c82f24c40a2246243fb1db7c9b229e68995de54153a4d8c",
+  "nodes": {
+    "Clean and Normalize Responses": "d1188b4f43da9c6b9fd3d0b8d02f86294ca85625f9c68c44012a9f54be7981ec",
+    "FairMatch Solver Engine": "2bb34e36666e2e914746a6f9e251fc124217ddf885465a716cebfe05bbf4503c"
+  },
+  "python_reference": {
+    "origin": "FairMatch Python Script/FairMatch_v9_4x6_Release/fairmatch.py",
+    "sha256": "edf9c310b22df8884caa088aac5c05dc350cfad0981fee788fec4be155e74cab"
+  }
+}

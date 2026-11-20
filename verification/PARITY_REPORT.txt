@@ -1,0 +1,18 @@
+FairMatch JavaScript/Python parity verification
+================================================
+Generated at (UTC): 2026-11-20T11:43:20.015835+00:00
+Workflow source commit: 62c1fd4e1c3fc90a1d97f5714296824017d322a4
+Workflow SHA-256: bbc9834e5f6785895c82f24c40a2246243fb1db7c9b229e68995de54153a4d8c
+Python reference SHA-256: edf9c310b22df8884caa088aac5c05dc350cfad0981fee788fec4be155e74cab
+Node.js: v24.19.0
+Python: 3.11.9
+Fixture: synthetic 24-person cohort; 25 submissions including one superseded response.
+Comparison: canonicalized team memberships and solver status must match; each constraint level may differ by at most 0.001.
+Scope: verifies current pinned workflow Code nodes against the included Python v4 reference. It does not recreate or prove any earlier comparison run.
+
+Scenario results:
+- Scenario 0: PASS; 25 submissions, 24 unique participants, 1 deduplication; status=FEASIBLE_WITH_REMAINING_SOFT_VIOLATIONS; team sizes=[6, 6, 6, 6]; veto pairs=4, in-team veto pairs=0; max constraint-level delta=0.000000.
+- Scenario 1: PASS; 25 submissions, 24 unique participants, 1 deduplication; status=FEASIBLE_WITH_REMAINING_SOFT_VIOLATIONS; team sizes=[6, 6, 6, 6]; veto pairs=4, in-team veto pairs=0; max constraint-level delta=0.000000.
+- Scenario 2: PASS; 25 submissions, 24 unique participants, 1 deduplication; status=FEASIBLE_WITH_REMAINING_SOFT_VIOLATIONS; team sizes=[6, 6, 6, 6]; veto pairs=4, in-team veto pairs=0; max constraint-level delta=0.000000.
+
+Privacy: all fixture identities are synthetic. No cohort roster or response data is included.
